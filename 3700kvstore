@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, time
+
+BROADCAST = "FFFF"
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        self.state = "follower"
+        self.leader = BROADCAST
+        self.e_time = None
+        self.recent = None
+        self.term = 0
+        self.votes = 0
+        self.db = {}
+        self.log = []
+        self.requests = []
+        self.record = {}
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    def send(self, message):
+        print(self.port)
+        print("SENDING")
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        
+    def log_refresh(self, msg):
+        for message in msg['content']:
+            if message not in self.log:
+                self.log.append({'key': message['key'], 'value': message['value']})
+                self.db[message['key']] = message['value']
+        
+    def handleGetorPut(self, msg):
+        if self.state == "leader":
+            if msg["type"] == "put":
+                self.log.append({'key': msg['key'], 'value': msg['value']})
+                self.db[msg['key']] = msg['value']
+                msg = {'src': self.id, 'dst': msg['src'],
+                    'leader': self.id, 'MID': msg['MID'], 'type': 'ok'}
+                self.send(msg)
+            elif msg["type"] == "get":
+                if msg["key"] in self.db:
+                    value = self.db[msg['key']]
+                    msg = {'src': self.id, 'dst': msg['src'],
+                        'leader': self.id, 'MID': msg['MID'], 'type': 'ok', 'value': value}
+                    self.send(msg)
+            else:
+                msg= {"src": self.id, "dst": msg['src'], "leader": self.id, "type": "fail", "MID": msg["MID"]}
+                self.send(msg)
+            for other in self.others:
+                msg = {"src": self.id, "dst": other, "leader": self.leader, "type": "append_request",
+                           'content': self.log}
+                self.send(msg)
+        elif self.leader != BROADCAST:
+            redirect = {"src": msg['dst'], "dst": msg['src'], "leader": self.leader, "type": "redirect",
+                        "MID": msg['MID']}
+            self.send(redirect)
+        else:
+            self.requests.append(msg)
+    
+    def get_log(self):
+        log = []
+        for i in range(100,0,-1):
+            if (len(self.log)<i):
+                continue
+            log.append(self.log[len(self.log)-i])
+        return log
+    
+    def election(self):
+        self.term = self.term + 1
+        self.leader = BROADCAST
+        self.votes = 1
+        self.request()
+    
+    def request(self):
+         for other in self.others:
+            msg = {
+                'src': self.id, 
+                'dst': other, 
+                'leader': self.leader,
+                'type': "vote_request", 
+                'term': self.term}
+            self.send(msg)
+        
+    def follower(self):
+        if time.time() - self.e_time > 0.5:
+            self.state = "candidate"
+            self.election()
+        
+    def handleLeader(self):
+        for other in self.others:
+            msg = {
+                'src': self.id, 
+                'dst': other, 
+                'leader': self.leader, 
+                'term': self.term, 
+                'type': "heartbeat"}
+            self.send(msg)
+    
+    def handleInitialState(self):
+        if self.state == "follower":
+            if time.time() - self.recent > 0.5 or self.leader == BROADCAST:
+                self.follower()
+        elif self.state == "leader":
+            self.last = time.time()
+            if time.time() - self.recent > .25:
+                self.handleLeader()
+        elif self.state == "candidate":
+            if time.time() - self.e_time > 0.5:
+                self.election()
+            
+    def run(self):
+        while True:
+            self.recent = time.time()
+            self.e_time = time.time()
+            data, addr = self.socket.recvfrom(65535)
+            msg = json.loads(data)
+            self.handleInitialState()
+            if msg["src"] == self.leader:
+                self.recent = time.time()
+            if msg["type"] == "get" or msg["type"] == "put":
+                self.handleGetorPut(msg)
+            if msg["type"] == "heartbeat":
+                if self.state == "leader":
+                    self.election()
+                    return
+                if msg['term'] >= self.term:
+                    self.state = "follower"
+                    self.recent = time.time()
+                    self.leader = msg['src']
+                for msg in self.requests:
+                    msg = {
+                        "src": msg['dst'], 
+                        "dst": msg['src'], 
+                        "leader": self.leader, 
+                        "type": "redirect",
+                        "MID": msg['MID']}
+                    self.send(msg)
+                self.requests = []
+            elif msg["type"] == "append_request":
+                self.log_refresh(msg)
+            elif msg["type"] == "vote_request":
+                self.leader = BROADCAST
+                if self.term >= msg['term']:
+                    msg = {
+                        'src': self.id, 
+                        'dst': msg['src'], 
+                        'leader': self.leader,
+                        'type': "vote_reject"}
+                else:
+                    self.term = msg['term']
+                    self.leader = msg['src']
+                    self.state = "follower"
+                    msg = {
+                        'src': self.id, 
+                        'dst': msg['src'], 
+                        'leader': self.leader,
+                        'type': "vote_approve", 
+                        'term': self.term, 
+                        'content': self.log}
+                    self.send(msg)
+            elif msg["type"] == "vote_approve":
+                if self.state == "candidate":
+                    self.log_refresh(msg)
+                    self.votes = self.votes + 1
+                    if self.votes >= 3:
+                        self.state = "leader"
+                        self.leader = self.id
+                        self.votes = 0
+                        self.db = {}
+                        for msg in self.log:
+                            self.db[msg['key']] = msg['value']
+            print("Received message '%s'" % (msg,), flush=True)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
