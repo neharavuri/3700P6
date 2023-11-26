@@ -12,6 +12,7 @@ class Replica:
         self.leader = BROADCAST
         self.term = 0
         self.state = "follower"
+        self.quorum = (len(self.others) + 1) // 2
         self.log = []
         self.log.append({'term': 0})
         self.vote_record = []
@@ -35,13 +36,10 @@ class Replica:
         print("Sent hello message: %s" % hello, flush=True)
 
     def send(self, message):
-        print(type(message))
-        print(message)
         self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
     
     def handlePut(self, msg):
-        print("PUT" + self.state)
-        if self.state == "leader":
+        if self.state == "leader" and msg != '':
             if msg['MID'] in self.timer:
                 if time.time() - self.timer[msg['MID']] > 1:
                     res = {
@@ -59,7 +57,7 @@ class Replica:
                 'term': self.term,
                 'key': msg['key'],
                 'value': msg['value'],
-                'client': msg['src'],
+                'dest': msg['src'],
                 'MID': msg['MID']
             }
             self.log.append(log_entry)
@@ -95,6 +93,7 @@ class Replica:
                     'MID': msg['MID'],
                     'value': value
                     }
+            #self is not the leader, but we know the leader then redirect
             elif self.leader != BROADCAST:
                 res = {
                     'src': self.id,
@@ -103,6 +102,7 @@ class Replica:
                     'type': 'redirect',
                     'MID': msg['MID'] 
                     }
+            #we don't know the leader
             elif self.leader == BROADCAST:
                 self.record_alone.append(msg)
             self.send(res)
@@ -110,11 +110,8 @@ class Replica:
             self.handlePut(msg)
     
     def send_append(self, others):
-        print("SENDING APPEND")
         if self.state == "leader":
             for other in others:
-                print(other)
-                print(self.next_indeces)
                 n_ind = self.next_indeces[other]
                 last_term = self.log[n_ind - 1]['term']
                 log_rec = self.log[n_ind:]
@@ -133,10 +130,12 @@ class Replica:
                 self.send(msg)
                 self.record_alone.pop()
     def handleRequestVote(self, msg):
+        #this msg info is ahead of our info
         if msg['term'] >= self.term:
             if self.state != "leader":
                 self.state = "follower"
                 self.term = msg['term']
+                #set the leader as the already chosen leader 
                 self.leader = msg['leader']
                 self.vote_record = []
                 self.voted_for = None
@@ -172,22 +171,12 @@ class Replica:
                     for match in self.match_indeces:
                         if self.match_indeces[match] >= index:
                             votes = votes + 1
-                    if votes >= (len(self.others) + 1) // 2:
+                    if votes >= self.quorum:
                         break
                 index = index - 1
             if index > self.commit:
                 self.commit = index
-                while(self.last_index < self.commit):
-                    self.last_index = self.last_index + 1
-                    self.store[self.log[self.last_index]['key']] = self.log[self.last_index]['value']
-                    if self.state == "leader":
-                        message = {
-                            'src': self.id,
-                            'dst': self.log[self.last_index]['client'],
-                            'leader': self.leader,
-                            'type': "ok",
-                            'MID': self.log[self.last_index]['MID']}
-                        self.send(message)
+                self.ap_comm()
     def reject_append(self, msg):
         if self.state == "leader":
             if msg['term'] > self.term:
@@ -202,8 +191,7 @@ class Replica:
         if self.state == "candidate":
             if msg['src'] not in self.vote_record:
                 self.vote_record.append(self.vote_record)
-                if len(self.vote_record) >= ((len(self.others) + 1) // 2) + 1:
-                    print("LEADER")
+                if len(self.vote_record) >= self.quorum + 1:
                     self.state = "leader"
                     self.leader = self.id
                     self.vote_record = []
@@ -212,9 +200,24 @@ class Replica:
                     for other in self.others:
                         self.next_indeces[other] = len(self.log)
                         self.match_indeces[other] = 0
+    def ap_comm(self):
+        while self.last_index < self.commit:
+            self.last_index = self.last_index + 1
+            self.store[self.log[self.last_index]['key']] = self.log[self.last_index]['value']
+            if self.state == "leader":
+                msg = {
+                    'src': self.id,
+                    'dst': self.log[self.last_index]['dest'],
+                    'leader': self.leader,
+                    'type': 'ok',
+                    'MID': self.log[self.last_index]['MID']
+                }
+                self.send(msg)
+    
     def handle_append(self, msg):
-        print("HANDLING APPEND")
+        #in the case that leader has already been chosen
         if msg['term'] >= self.term:
+            #become a follower and update information
             self.term - msg['term']
             self.state = "follower"
             self.leader = msg['leader']
@@ -257,8 +260,8 @@ class Replica:
                     if self.log[i]['term'] == self.log[msg['prev_log_idx']]['term']:
                         reject_append_msg['next_idx'] = i
                         break
-                    else:
-                        reject_append_msg['next_idx'] = len(self.log) - 1
+                else:
+                    reject_append_msg['next_idx'] = len(self.log) - 1
                 self.send(reject_append_msg)
                 return
             self.log = self.log[: (msg['prev_log_idx']) + 1]
@@ -268,18 +271,30 @@ class Replica:
             accept_append_msg['next_idx'] = len(self.log)
             if msg['content'] != 0:
                 self.send(accept_append_msg)
-            while self.last_index < self.commit:
-                self.last_index = self.last_index + 1
-                self.store[self.log[self.last_index]['key']] = self.log[self.last_index]['value']
-                if self.state == "leader":
-                    msg = {
-                        'src': self.id,
-                        'dst': self.log[self.last_index]['client'],
-                        'leader': self.leader,
-                        'type': 'ok',
-                        'MID': self.log[self.last_index]['MID']
-                    }
-                    self.send(msg)
+            self.ap_comm()
+    
+    def election(self):
+        #increment term
+        self.term = self.term + 1
+        #follower becomes a candidate
+        self.state = "candidate"
+        #vote for youtself
+        self.voted_for = self.id
+        self.vote_record = []
+        self.vote_record.append(self.id)
+        #request vote from others
+        for other in self.others:
+            message = {
+                'src': self.id,
+                'dst': other,
+                'leader': self.leader,
+                'term': self.term,
+                'type': "request_vote",
+                'candidate_id': self.id,
+                'last_log_idx': len(self.log) - 1,
+                'last_log_term': self.log[-1]['term']
+                }
+            self.send(message)
                 
     def run(self):
         self.heartbeat_time = time.time()
@@ -293,31 +308,10 @@ class Replica:
                 print("Received message '%s'" % (msg,), flush=True)
             except BlockingIOError:
                 if clock - self.append_time >= self.timeout and self.state != "leader":
-                    print("GOT INTO THIS")
-                    print(len(self.record_alone))
                     for rec in self.record_alone:
                         self.send(rec)
                     self.record_alone = []
-                    self.term = self.term + 1
-                    self.state = "candidate"
-                    self.voted_for = self.id
-                    self.vote_record = []
-                    self.vote_record.append(self.id)
-                    print(self.others)
-                    for other in self.others:
-                        print("VOTE")
-                        message = {
-                            'src': self.id,
-                            'dst': other,
-                            'leader': self.leader,
-                            'term': self.term,
-                            'type': "request_vote",
-                            'candidate_id': self.id,
-                            'last_log_idx': len(self.log) - 1,
-                            'last_log_term': self.log[-1]['term']
-                        }
-                        print(message)
-                        self.send(message)
+                    self.election()
                     self.append_time = time.time()
                 if self.state == "leader":
                     if clock - self.heartbeat_time >= 0.15:
@@ -325,6 +319,7 @@ class Replica:
                         self.heartbeat_time = time.time()
                 continue
             msg = json.loads(msg)
+            #based on the type of message we receive, do different things
             if msg['type'] == 'put' or msg['type'] == 'get':
                 self.respondGetOrPut(msg)
             elif msg['type'] == 'request_vote':
