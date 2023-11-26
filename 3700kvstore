@@ -26,6 +26,7 @@ class Replica:
         self.heartbeat_time = time.time()
         self.voted_for = None
         self.record_alone = []
+        
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
         self.socket.setblocking(False)
@@ -187,23 +188,30 @@ class Replica:
                 self.next_indeces[msg['src']] = self.next_indeces[msg['src']] - 1
             self.send_append([msg['src']])
                         
+    def become_leader(self):
+        self.state = "leader"
+        self.leader = self.id
+        self.vote_record = []
+        self.next_indeces = {}
+        self.match_indeces = {}
+        
     def accept_vote(self, msg):
         if self.state == "candidate":
             if msg['src'] not in self.vote_record:
                 self.vote_record.append(self.vote_record)
                 if len(self.vote_record) >= self.quorum + 1:
-                    self.state = "leader"
-                    self.leader = self.id
-                    self.vote_record = []
-                    self.next_indeces = {}
-                    self.match_indeces = {}
+                    self.become_leader()
                     for other in self.others:
                         self.next_indeces[other] = len(self.log)
                         self.match_indeces[other] = 0
+                        
+    def add_to_store(self, key, value):
+        self.store[key] = value
+        
     def ap_comm(self):
         while self.last_index < self.commit:
             self.last_index = self.last_index + 1
-            self.store[self.log[self.last_index]['key']] = self.log[self.last_index]['value']
+            self.add_to_store(self.log[self.last_index]['key'], self.log[self.last_index]['value'] )
             if self.state == "leader":
                 msg = {
                     'src': self.id,
@@ -212,13 +220,13 @@ class Replica:
                     'type': 'ok',
                     'MID': self.log[self.last_index]['MID']
                 }
-                self.send(msg)
+                self.send(msg)        
     
     def handle_append(self, msg):
         #in the case that leader has already been chosen
         if msg['term'] >= self.term:
             #become a follower and update information
-            self.term - msg['term']
+            self.term = msg['term']
             self.state = "follower"
             self.leader = msg['leader']
             self.voted_for = None
@@ -234,54 +242,55 @@ class Replica:
                 self.send(m)
             self.record_alone = []
         if self.state == "follower":
-            reject_append_msg = {
+            base_reject = {
                 'src': self.id,
                 'dst': msg['src'],
                 'leader': self.leader,
                 'type': 'reject_append',
                 'term': self.term
             }
-            accept_append_msg = {
-                'src': self.id,
-                'dst': msg['src'],
-                'leader': self.leader,
-                'type': "accept_append",
-                'term': self.term
-            }
             if msg['term'] < self.term:
-                self.send(reject_append_msg)
+                self.send(base_reject)
                 return
             self.append_time = time.time()
             if len(self.log) - 1 < msg['prev_log_idx']:
-                self.send(reject_append_msg)
+                self.send(base_reject)
                 return
             if msg['prev_log_term'] != self.log[msg['prev_log_idx']]['term']:
                 for i in range(len(self.log)):
                     if self.log[i]['term'] == self.log[msg['prev_log_idx']]['term']:
-                        reject_append_msg['next_idx'] = i
+                        base_reject['next_idx'] = i
                         break
                 else:
-                    reject_append_msg['next_idx'] = len(self.log) - 1
-                self.send(reject_append_msg)
+                    base_reject['next_idx'] = len(self.log) - 1
+                self.send(base_reject)
                 return
             self.log = self.log[: (msg['prev_log_idx']) + 1]
             self.log.extend(msg['content'])
             if msg['commit'] > self.commit:
                 self.commit = min(msg['commit'], len(self.log) - 1)
-            accept_append_msg['next_idx'] = len(self.log)
             if msg['content'] != 0:
-                self.send(accept_append_msg)
+                self.send({
+                'src': self.id,
+                'dst': msg['src'],
+                'leader': self.leader,
+                'type': "accept_append",
+                'term': self.term,
+                'next_idx': len(self.log)
+            })
             self.ap_comm()
     
-    def election(self):
-        #increment term
+    def vote_for_self(self):
         self.term = self.term + 1
         #follower becomes a candidate
         self.state = "candidate"
         #vote for youtself
         self.voted_for = self.id
         self.vote_record = []
-        self.vote_record.append(self.id)
+        self.vote_record.append(self.id)    
+    
+    def election(self):
+        self.vote_for_self()
         #request vote from others
         for other in self.others:
             message = {
@@ -295,6 +304,16 @@ class Replica:
                 'last_log_term': self.log[-1]['term']
                 }
             self.send(message)
+            
+    def handleVote(self, msg):
+        if msg['type'] == 'accept_vote':
+            self.accept_vote(msg)
+        elif msg['type'] == 'reject_vote':
+            if self.state == "candidate" and msg['term'] >= self.term:
+                self.term = msg['term']
+                self.state = "follower"
+                self.vote_record = []
+                self.voted_for = None
                 
     def run(self):
         self.heartbeat_time = time.time()
@@ -329,16 +348,9 @@ class Replica:
             elif msg['type'] == 'accept_append':
                 self.accept_append(msg)
             elif msg['type'] == 'reject_append':
-                print(msg)
                 self.reject_append(msg)
-            elif msg['type'] == 'accept_vote':
-                self.accept_vote(msg)
-            elif msg['type'] == 'reject_vote':
-                if self.state == "candidate" and msg['term'] >= self.term:
-                    self.term = msg['term']
-                    self.state = "follower"
-                    self.vote_record = []
-                    self.voted_for = None
+            elif msg['type'] == 'accept_vote' or msg['type'] == 'reject_vote':
+                self.handleVote(msg)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
