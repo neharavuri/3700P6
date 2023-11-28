@@ -16,7 +16,7 @@ class Replica:
         self.log = []
         self.log.append({'term': 0})
         self.vote_record = []
-        self.timeout = random.uniform(0.2,0.4)
+        self.timeout = random.uniform(0.3,0.4)
         self.commit = 0
         self.last_index = 0
         self.store = {}
@@ -26,7 +26,6 @@ class Replica:
         self.heartbeat_time = time.time()
         self.voted_for = None
         self.record_alone = []
-        
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
         self.socket.setblocking(False)
@@ -40,7 +39,7 @@ class Replica:
         self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
     
     def handlePut(self, msg):
-        if self.state == "leader" and msg != '':
+        if self.state == "leader":
             if msg['MID'] in self.timer:
                 if time.time() - self.timer[msg['MID']] > 1:
                     res = {
@@ -65,8 +64,6 @@ class Replica:
             if self.e_time - time.time() >= 0.01:
                 self.send_append(self.others)
                 self.e_time = time.time()
-        elif self.state == "leader":
-            self.send_append(self.others)
         elif self.leader == BROADCAST:
             self.record_alone.append(msg)
         else:
@@ -79,7 +76,6 @@ class Replica:
                 }
             self.send(msg)
                 
-            
     def respondGetOrPut(self, msg):
         if msg['type'] == "get":
             if self.state == "leader":
@@ -314,43 +310,43 @@ class Replica:
                 self.state = "follower"
                 self.vote_record = []
                 self.voted_for = None
-                
+        
     def run(self):
         self.heartbeat_time = time.time()
         self.append_time = time.time()
         self.e_time = time.time()
         while True:
-            try:
-                clock = time.time()
+            msg=None
+            clock = time.time()
+            ready = select.select([self.socket], [], [], 0.01)[0]
+            if ready:
                 data, addr = self.socket.recvfrom(65535)
                 msg = data.decode('utf-8')
-                print("Received message '%s'" % (msg,), flush=True)
-            except BlockingIOError:
-                if clock - self.append_time >= self.timeout and self.state != "leader":
-                    for rec in self.record_alone:
-                        self.send(rec)
-                    self.record_alone = []
-                    self.election()
-                    self.append_time = time.time()
-                if self.state == "leader":
-                    if clock - self.heartbeat_time >= 0.15:
-                        self.send_append(self.others)
-                        self.heartbeat_time = time.time()
-                continue
-            msg = json.loads(msg)
-            #based on the type of message we receive, do different things
-            if msg['type'] == 'put' or msg['type'] == 'get':
-                self.respondGetOrPut(msg)
-            elif msg['type'] == 'request_vote':
-                self.handleRequestVote(msg)
-            elif msg['type'] == 'append_entries':
-                self.handle_append(msg)
-            elif msg['type'] == 'accept_append':
-                self.accept_append(msg)
-            elif msg['type'] == 'reject_append':
-                self.reject_append(msg)
-            elif msg['type'] == 'accept_vote' or msg['type'] == 'reject_vote':
-                self.handleVote(msg)
+                msg = json.loads(msg)
+            if clock - self.append_time >= self.timeout and self.state != "leader":
+                for rec in self.record_alone:
+                    self.send(rec)
+                self.record_alone = []
+                self.election()
+                self.append_time = time.time()
+            if self.state == "leader":
+                if clock - self.heartbeat_time >= 0.15:
+                    self.send_append(self.others)
+                    self.heartbeat_time = time.time()
+            if msg:
+                #based on the type of message we receive, do different things
+                if msg['type'] == 'put' or msg['type'] == 'get':
+                    self.respondGetOrPut(msg)
+                elif msg['type'] == 'request_vote':
+                    self.handleRequestVote(msg)
+                elif msg['type'] == 'append_entries':
+                    self.handle_append(msg)
+                elif msg['type'] == 'accept_append':
+                    self.accept_append(msg)
+                elif msg['type'] == 'reject_append':
+                    self.reject_append(msg)
+                elif msg['type'] == 'accept_vote' or msg['type'] == 'reject_vote':
+                    self.handleVote(msg)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
