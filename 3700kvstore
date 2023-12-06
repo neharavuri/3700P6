@@ -1,9 +1,16 @@
+
 #!/usr/bin/env python3
 
 import random, argparse, socket, time, json, select, struct, sys, math, os
 
 BROADCAST = "FFFF"
-
+'''
+This class represents an instance of a single replica
+Parameters:
+    port: the port to which we are connecting
+    id: id of this replica
+    others: ids of other replicas
+'''
 class Replica:
     def __init__(self, port, id, others):
         self.port = port
@@ -11,23 +18,35 @@ class Replica:
         self.others = others
         self.leader = BROADCAST
         self.term = 0
+        #initial state should be set to follower
         self.state = "follower"
-        self.quorum = (len(self.others) + 1) // 2
         self.log = []
-        self.log.append({'term': 0})
+        #start the log off with an entry for the 0 term
+        self.log.append({'term': 0,
+                'key': None,
+                'value': None,
+                'dest': None,
+                'MID': None})
         self.vote_record = []
+        #randomly pick a timeout value
         self.timeout = random.uniform(0.3,0.4)
         self.commit = 0
         self.last_index = 0
+        #represents our key value store
         self.store = {}
         self.timer = {}
+        #keeps track of election time 
         self.e_time = time.time()
         self.append_time = time.time()
         self.heartbeat_time = time.time()
         self.voted_for = None
+        #the majority that needs to be reached
+        self.quorum = (len(self.others) + 1) // 2
+        #record of no leaders
         self.record_alone = []
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
+        #set the socket to non blocking
         self.socket.setblocking(False)
 
         print("Replica %s starting up" % self.id, flush=True)
@@ -35,12 +54,24 @@ class Replica:
         self.send(hello)
         print("Sent hello message: %s" % hello, flush=True)
 
+    '''
+    This function sends our messages
+    Parameters:
+        message: message we are trying to send
+    '''
     def send(self, message):
         self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
     
+    '''
+    This function handles put messages
+    Parameters:
+        msg: the put message
+    '''
     def handlePut(self, msg):
+        #only want to put is this replica is the leader
         if self.state == "leader":
             if msg['MID'] in self.timer:
+                #timeout has occurred 
                 if time.time() - self.timer[msg['MID']] > 1:
                     res = {
                         'src': self.id,
@@ -51,6 +82,7 @@ class Replica:
                     }
                     self.send(res)
                     del self.timer[msg['MID']]
+            #add time entry if it doest not exist
             elif msg['MID'] not in self.timer:
                 self.timer[msg['MID']] = time.time()
             log_entry = {
@@ -64,6 +96,7 @@ class Replica:
             if self.e_time - time.time() >= 0.01:
                 self.send_append(self.others)
                 self.e_time = time.time()
+        #we don't know who the leader is
         elif self.leader == BROADCAST:
             self.record_alone.append(msg)
         else:
@@ -75,11 +108,17 @@ class Replica:
                 'MID': msg['MID']
                 }
             self.send(msg)
-                
+    '''
+    This function handles messages that are either gets or puts
+    Parameters:
+        msg: the get or put message
+    '''
     def respondGetOrPut(self, msg):
+        #get type message
         if msg['type'] == "get":
             if self.state == "leader":
                 value = ""
+                #only include value in the message if it exists
                 if msg['key'] in self.store:
                     value = self.store[msg['key']]
                 res = {
@@ -103,9 +142,15 @@ class Replica:
             elif self.leader == BROADCAST:
                 self.record_alone.append(msg)
             self.send(res)
+        #dealing with a put message
         elif msg['type'] == "put":
             self.handlePut(msg)
     
+    '''
+    This function sends "append_entries" messages
+    Parameters:
+        others: the members to which we are sending the append message
+    '''
     def send_append(self, others):
         if self.state == "leader":
             for other in others:
@@ -118,14 +163,20 @@ class Replica:
                     'type': 'append_entries',
                     'term': self.term,
                     'leader': self.leader,
-                    'prev_log_idx': n_ind - 1,
-                    'prev_log_term': last_term,
+                    'prev_index': n_ind - 1,
+                    'prev_term': last_term,
                     'content': log_rec,
                     'commit': self.commit
                     }
                 self.record_alone.append(msg)
                 self.send(msg)
                 self.record_alone.pop()
+                
+    '''
+    This function responds to "request_vote" messages
+    Parameters:
+        msg: the request_vote message
+    '''     
     def handleRequestVote(self, msg):
         #this msg info is ahead of our info
         if msg['term'] >= self.term:
@@ -137,9 +188,20 @@ class Replica:
                 self.vote_record = []
                 self.voted_for = None
         if self.state == "follower":
-            if msg['term'] < self.term or not (
-                self.voted_for is None or self.voted_for == msg['src']
-            ) or (len(self.log) - 1 > msg['last_log_idx']) or self.log[-1]['term'] > msg['last_log_term']:
+            #need to have voted for someone else
+            no_vote = self.voted_for is None or self.voted_for == msg['src']
+            #log not completely updates
+            invalid_log = len(self.log) - 1 > msg['last_log_idx']
+            if msg['term'] < self.term or not no_vote or self.log[-1]['term'] > msg['last_log_term']:
+                reject =  {
+                    'src': self.id,
+                    'dst': msg['src'],
+                    'leader': self.leader,
+                    'type': 'reject_vote',
+                    'term': self.term
+                    }
+                self.send(reject)
+            elif invalid_log:
                 reject =  {
                     'src': self.id,
                     'dst': msg['src'],
@@ -157,15 +219,24 @@ class Replica:
                     'term': self.term
                     }
                 self.send(accept)
+                
+    '''
+    This function handles the "accept_append" message type
+    Parameters:
+        msg: the accept_append message
+    '''
     def accept_append(self, msg):
+        #only execute if this replica is the leader
         if self.state == "leader":
-            self.next_indeces[msg['src']] = msg['next_idx']
-            self.match_indeces[msg['src']] = msg['next_idx'] - 1
+            self.next_indeces[msg['src']] = msg['next_index']
+            self.match_indeces[msg['src']] = msg['next_index'] - 1
             index = len(self.log) - 1
+            #traverse backwards through the log and match indeces until quorom is hit
             while index >= 0:
                 if self.log[index]['term'] == self.term:
                     votes = 0
                     for match in self.match_indeces:
+                        #count the amount of votes
                         if self.match_indeces[match] >= index:
                             votes = votes + 1
                     if votes >= self.quorum:
@@ -174,39 +245,67 @@ class Replica:
             if index > self.commit:
                 self.commit = index
                 self.ap_comm()
+    '''
+    This function responds to "reject_append" messages
+    Parameters:
+        msg: the reject_append message
+    '''            
     def reject_append(self, msg):
+        #only execute if this replica is the leader
         if self.state == "leader":
+            #leader has changed
             if msg['term'] > self.term:
                 self.state = "follower"
-            if 'next_idx' in msg:
-                self.next_indeces[msg['src']] = msg['next_idx']
+            if 'next_index' in msg:
+                self.next_indeces[msg['src']] = msg['next_index']
             else:
                 self.next_indeces[msg['src']] = self.next_indeces[msg['src']] - 1
             self.send_append([msg['src']])
-                        
+    '''
+    This function makes this replica the leader by updating and resetting certain fields
+    '''                   
     def become_leader(self):
         self.state = "leader"
         self.leader = self.id
         self.vote_record = []
         self.next_indeces = {}
         self.match_indeces = {}
-        
+
+    '''
+    This function responds to "accept_vote" messages
+    Parameters:
+        msg: the accept_vote message
+    '''     
     def accept_vote(self, msg):
         if self.state == "candidate":
             if msg['src'] not in self.vote_record:
-                self.vote_record.append(self.vote_record)
+                #record the vote
+                self.vote_record.append(msg['src'])
+                #check if we have reached majority
                 if len(self.vote_record) >= self.quorum + 1:
+                    #won the election!
                     self.become_leader()
                     for other in self.others:
                         self.next_indeces[other] = len(self.log)
                         self.match_indeces[other] = 0
-                        
+     
+    '''
+    This function adds a key-value entry to our store
+    Parameters:
+        key: the key to add
+        value: the value to map the key to
+    '''                        
     def add_to_store(self, key, value):
         self.store[key] = value
-        
+    
+    '''
+    This function applies the latest commit
+    '''     
     def ap_comm(self):
+        #make sure the commit we are trying to apply is later than the last committed index
         while self.last_index < self.commit:
             self.last_index = self.last_index + 1
+            #add key value pair to our store
             self.add_to_store(self.log[self.last_index]['key'], self.log[self.last_index]['value'] )
             if self.state == "leader":
                 msg = {
@@ -218,6 +317,11 @@ class Replica:
                 }
                 self.send(msg)        
     
+    '''
+    This function responds to "append_entries" messages
+    Parameters:
+        msg: the append_entries message
+    '''     
     def handle_append(self, msg):
         #in the case that leader has already been chosen
         if msg['term'] >= self.term:
@@ -245,24 +349,30 @@ class Replica:
                 'type': 'reject_append',
                 'term': self.term
             }
+            #if the message is still on an earlier term
             if msg['term'] < self.term:
                 self.send(base_reject)
                 return
             self.append_time = time.time()
-            if len(self.log) - 1 < msg['prev_log_idx']:
+            #the message's log index is ahead of our log
+            if len(self.log) - 1 < msg['prev_index']:
                 self.send(base_reject)
                 return
-            if msg['prev_log_term'] != self.log[msg['prev_log_idx']]['term']:
+            #if the previous log term is not matching the log, update next index
+            if msg['prev_term'] != self.log[msg['prev_index']]['term']:
                 for i in range(len(self.log)):
-                    if self.log[i]['term'] == self.log[msg['prev_log_idx']]['term']:
-                        base_reject['next_idx'] = i
+                    if self.log[i]['term'] == self.log[msg['prev_index']]['term']:
+                        base_reject['next_index'] = i
                         break
                 else:
-                    base_reject['next_idx'] = len(self.log) - 1
+                    base_reject['next_index'] = len(self.log) - 1
                 self.send(base_reject)
                 return
-            self.log = self.log[: (msg['prev_log_idx']) + 1]
+            #recalculate log
+            self.log = self.log[: (msg['prev_index']) + 1]
+            #add message's content onto log
             self.log.extend(msg['content'])
+            #if the message's commit is ahead of ours
             if msg['commit'] > self.commit:
                 self.commit = min(msg['commit'], len(self.log) - 1)
             if msg['content'] != 0:
@@ -272,19 +382,25 @@ class Replica:
                 'leader': self.leader,
                 'type': "accept_append",
                 'term': self.term,
-                'next_idx': len(self.log)
+                'next_index': len(self.log)
             })
+            #apply the commit
             self.ap_comm()
-    
+    '''
+    This function updates field to simulate this replica voting for itself
+    '''     
     def vote_for_self(self):
         self.term = self.term + 1
         #follower becomes a candidate
         self.state = "candidate"
-        #vote for youtself
+        #vote for yourself
         self.voted_for = self.id
         self.vote_record = []
         self.vote_record.append(self.id)    
-    
+        
+    '''
+    This function simulates the RAFT leader election process
+    '''     
     def election(self):
         self.vote_for_self()
         #request vote from others
@@ -300,7 +416,12 @@ class Replica:
                 'last_log_term': self.log[-1]['term']
                 }
             self.send(message)
-            
+    
+    '''
+    This function handles "accept_vote" and reject_vote" messages
+    Parameters:
+        msg: the accept or handle vote message
+    '''          
     def handleVote(self, msg):
         if msg['type'] == 'accept_vote':
             self.accept_vote(msg)
@@ -310,8 +431,12 @@ class Replica:
                 self.state = "follower"
                 self.vote_record = []
                 self.voted_for = None
-        
+    
+    '''
+    This main program that runs all the functionality of the program and reads/interprets the client message
+    '''         
     def run(self):
+        #set initial timers
         self.heartbeat_time = time.time()
         self.append_time = time.time()
         self.e_time = time.time()
@@ -323,6 +448,7 @@ class Replica:
                 data, addr = self.socket.recvfrom(65535)
                 msg = data.decode('utf-8')
                 msg = json.loads(msg)
+            # if timeout and election has not occurred yet
             if clock - self.append_time >= self.timeout and self.state != "leader":
                 for rec in self.record_alone:
                     self.send(rec)
